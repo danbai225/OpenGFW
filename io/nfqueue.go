@@ -15,7 +15,6 @@ import (
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/florianl/go-nfqueue"
 	"github.com/mdlayher/netlink"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -30,9 +29,6 @@ const (
 )
 
 func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
-	if n.local && n.rst {
-		return nil, errors.New("tcp rst is not supported in local mode")
-	}
 	table := &nftTableSpec{
 		Family: nftFamily,
 		Table:  n.table,
@@ -40,47 +36,78 @@ func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
 	table.Defines = append(table.Defines, fmt.Sprintf("define ACCEPT_CTMARK=%d", n.connMarkAccept))
 	table.Defines = append(table.Defines, fmt.Sprintf("define DROP_CTMARK=%d", n.connMarkDrop))
 	table.Defines = append(table.Defines, fmt.Sprintf("define QUEUE_NUM=%d", n.queueNum))
-	if n.local {
-		table.Chains = []nftChainSpec{
-			{Chain: "INPUT", Header: "type filter hook input priority filter; policy accept;"},
-			{Chain: "OUTPUT", Header: "type filter hook output priority filter; policy accept;"},
-		}
-	} else {
-		table.Chains = []nftChainSpec{
-			{Chain: "FORWARD", Header: "type filter hook forward priority filter; policy accept;"},
-		}
+
+	table.Chains = []nftChainSpec{}
+	if n.enabledChains.Input {
+		table.Chains = append(table.Chains, nftChainSpec{
+			Chain:  "INPUT",
+			Header: "type filter hook input priority filter; policy accept;",
+		})
 	}
+	if n.enabledChains.Output {
+		table.Chains = append(table.Chains, nftChainSpec{
+			Chain:  "OUTPUT",
+			Header: "type filter hook output priority filter; policy accept;",
+		})
+	}
+	if n.enabledChains.Forward {
+		table.Chains = append(table.Chains, nftChainSpec{
+			Chain:  "FORWARD",
+			Header: "type filter hook forward priority filter; policy accept;",
+		})
+	}
+
 	for i := range table.Chains {
 		c := &table.Chains[i]
+
+		if c.Chain == "INPUT" || c.Chain == "OUTPUT" {
+			c.Rules = append(c.Rules, "iif lo accept")
+			c.Rules = append(c.Rules, "oif lo accept")
+		}
+
 		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
-		if n.rst {
+
+		if c.Chain == "FORWARD" && n.rst {
 			c.Rules = append(c.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
 		}
+
 		c.Rules = append(c.Rules, "ct mark $DROP_CTMARK counter drop")
 		c.Rules = append(c.Rules, "counter queue num $QUEUE_NUM bypass")
 	}
+
 	return table, nil
 }
 
 func (n *nfqueuePacketIO) generateIptRules() ([]iptRule, error) {
-	if n.local && n.rst {
-		return nil, errors.New("tcp rst is not supported in local mode")
-	}
 	var chains []string
-	if n.local {
-		chains = []string{"INPUT", "OUTPUT"}
-	} else {
-		chains = []string{"FORWARD"}
+
+	if n.enabledChains.Input {
+		chains = append(chains, "INPUT")
 	}
+	if n.enabledChains.Output {
+		chains = append(chains, "OUTPUT")
+	}
+	if n.enabledChains.Forward {
+		chains = append(chains, "FORWARD")
+	}
+
 	rules := make([]iptRule, 0, 4*len(chains))
 	for _, chain := range chains {
-		// Bypass protected connections
+		if chain == "INPUT" {
+			rules = append(rules, iptRule{"filter", chain, []string{"-i", "lo", "-j", "ACCEPT"}})
+		}
+		if chain == "OUTPUT" {
+			rules = append(rules, iptRule{"filter", chain, []string{"-o", "lo", "-j", "ACCEPT"}})
+		}
+
 		rules = append(rules, iptRule{"filter", chain, []string{"-m", "mark", "--mark", strconv.Itoa(n.connMarkAccept), "-j", "CONNMARK", "--set-mark", strconv.Itoa(n.connMarkAccept)}})
 		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(n.connMarkAccept), "-j", "ACCEPT"}})
-		if n.rst {
+
+		if chain == "FORWARD" && n.rst {
 			rules = append(rules, iptRule{"filter", chain, []string{"-p", "tcp", "-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop), "-j", "REJECT", "--reject-with", "tcp-reset"}})
 		}
+
 		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop), "-j", "DROP"}})
 		rules = append(rules, iptRule{"filter", chain, []string{"-j", "NFQUEUE", "--queue-num", strconv.Itoa(n.queueNum), "--queue-bypass"}})
 	}
@@ -101,6 +128,7 @@ type nfqueuePacketIO struct {
 	table          string // nftable name
 	connMarkAccept int
 	connMarkDrop   int
+	enabledChains  EnabledChainsConfig
 
 	// iptables not nil = use iptables instead of nftables
 	ipt4 *iptables.IPTables
@@ -120,6 +148,14 @@ type NFQueuePacketIOConfig struct {
 	WriteBuffer int
 	Local       bool
 	RST         bool
+
+	EnabledChains EnabledChainsConfig
+}
+
+type EnabledChainsConfig struct {
+	Input   bool
+	Output  bool
+	Forward bool
 }
 
 func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
@@ -146,6 +182,24 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 	if config.ConnMarkAccept == config.ConnMarkDrop {
 		return nil, errors.New("connMarkAccept and connMarkDrop cannot be the same")
 	}
+
+	if !config.EnabledChains.Input && !config.EnabledChains.Output && !config.EnabledChains.Forward {
+		if config.Local {
+			config.EnabledChains.Input = true
+			config.EnabledChains.Output = true
+		} else {
+			config.EnabledChains.Forward = true
+		}
+	}
+
+	if !config.EnabledChains.Input && !config.EnabledChains.Output && !config.EnabledChains.Forward {
+		return nil, errors.New("at least one chain must be enabled")
+	}
+
+	if config.RST && (config.EnabledChains.Input || config.EnabledChains.Output) {
+		return nil, errors.New("tcp rst is not supported with INPUT/OUTPUT chains")
+	}
+
 	var ipt4, ipt6 *iptables.IPTables
 	var err error
 	if nftCheck() != nil {
@@ -187,12 +241,14 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		n:              n,
 		local:          config.Local,
 		rst:            config.RST,
+		rSet:           false,
 		queueNum:       int(*config.QueueNum),
 		table:          config.Table,
 		connMarkAccept: int(config.ConnMarkAccept),
 		connMarkDrop:   int(config.ConnMarkDrop),
 		ipt4:           ipt4,
 		ipt6:           ipt6,
+		enabledChains:  config.EnabledChains,
 		protectedDialer: &net.Dialer{
 			Control: func(network, address string, c syscall.RawConn) error {
 				var err error
@@ -232,7 +288,7 @@ func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error
 		},
 		func(e error) int {
 			if opErr := (*netlink.OpError)(nil); errors.As(e, &opErr) {
-				if errors.Is(opErr.Err, unix.ENOBUFS) {
+				if opErr.Err != nil && opErr.Err.Error() == "no buffer space available" {
 					// Kernel buffer temporarily full, ignore
 					return 0
 				}
@@ -266,8 +322,8 @@ func (n *nfqueuePacketIO) packetAttributeSanityCheck(a nfqueue.Attribute) (ok bo
 		return false, nfqueue.NfDrop
 	}
 	if a.Ct == nil {
-		// Multicast packets may not have a conntrack, but only appear in local mode
-		if n.local {
+		// Multicast packets may not have a conntrack, but only appear in local mode (INPUT/OUTPUT)
+		if n.enabledChains.Input || n.enabledChains.Output {
 			return false, nfqueue.NfAccept
 		}
 		return false, nfqueue.NfDrop

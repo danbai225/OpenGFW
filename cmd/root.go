@@ -186,6 +186,7 @@ type cliConfigIO struct {
 	Input       bool `mapstructure:"input"`
 	Output      bool `mapstructure:"output"`
 	Forward     bool `mapstructure:"forward"`
+	Docker      bool `mapstructure:"docker"`
 }
 
 type cliConfigReplay struct {
@@ -239,6 +240,7 @@ func (c *cliConfig) fillIO(config *engine.Config) error {
 				Output:  c.IO.Output,
 				Forward: c.IO.Forward,
 			},
+			Docker: c.IO.Docker,
 		})
 	}
 

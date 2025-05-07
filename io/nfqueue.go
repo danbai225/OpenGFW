@@ -90,6 +90,9 @@ func (n *nfqueuePacketIO) generateIptRules() ([]iptRule, error) {
 	}
 	if n.enabledChains.Forward {
 		chains = append(chains, "FORWARD")
+		if n.docker {
+			chains = append(chains, "DOCKER-USER")
+		}
 	}
 
 	rules := make([]iptRule, 0, 4*len(chains))
@@ -129,7 +132,7 @@ type nfqueuePacketIO struct {
 	connMarkAccept int
 	connMarkDrop   int
 	enabledChains  EnabledChainsConfig
-
+	docker         bool
 	// iptables not nil = use iptables instead of nftables
 	ipt4 *iptables.IPTables
 	ipt6 *iptables.IPTables
@@ -148,6 +151,7 @@ type NFQueuePacketIOConfig struct {
 	WriteBuffer int
 	Local       bool
 	RST         bool
+	Docker      bool
 
 	EnabledChains EnabledChainsConfig
 }
@@ -249,6 +253,7 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		ipt4:           ipt4,
 		ipt6:           ipt6,
 		enabledChains:  config.EnabledChains,
+		docker:         config.Docker,
 		protectedDialer: &net.Dialer{
 			Control: func(network, address string, c syscall.RawConn) error {
 				var err error
@@ -501,9 +506,16 @@ type iptRule struct {
 func iptsBatchAppendUnique(ipts []*iptables.IPTables, rules []iptRule) error {
 	for _, r := range rules {
 		for _, ipt := range ipts {
-			err := ipt.AppendUnique(r.Table, r.Chain, r.RuleSpec...)
-			if err != nil {
-				return err
+			if r.Chain == "DOCKER-USER" {
+				err := ipt.Insert(r.Table, r.Chain, 1, r.RuleSpec...)
+				if err != nil {
+					return err
+				}
+			} else {
+				err := ipt.AppendUnique(r.Table, r.Chain, r.RuleSpec...)
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
